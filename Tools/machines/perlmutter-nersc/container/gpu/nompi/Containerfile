@@ -1,6 +1,7 @@
 # Build this container from its current directory:
 #   podman build --build-arg NJOBS=6 -t warpx-perlmutter-nompi .
 # Adjust NJOBS to the number of processes to use for parallel compilation.
+# If NJOBS is not passed, all available cores are used.
 #
 # WarpX executables are installed in /opt/warpx/bin
 # WarpX Python bindings are installed in /opt/venv
@@ -25,12 +26,11 @@
 # Base System and Essential Tools Installation
 FROM nvidia/cuda:13.2.1-devel-ubuntu22.04 AS warpx-dev
 
-# WarpX version
-ARG warpx_version=25.11
-
 # Build parallelism
-ARG NJOBS
-ENV NJOBS=$NJOBS
+# Note: this is a build ARG and not an ENV, so that changing it neither
+#       invalidates the layer cache of the whole image nor leaks into the
+#       runtime image. Unset means: use all available cores.
+ARG NJOBS=
 
 # Perlmutter GPU: A100
 # Perlmutter CPU: Zen v3
@@ -42,18 +42,27 @@ ENV CUDAARCHS=80               \
 ENV DEBIAN_FRONTEND=noninteractive
 
 # CMake global options
+# Note: every project below is additionally configured with an explicit
+#       -DCMAKE_BUILD_TYPE=Release. Without it, projects that do not pick a
+#       default themselves are compiled without any optimization flags at all.
 ENV CMAKE_GENERATOR="Ninja"
 
 # Autotools global options
 ENV FORCE_UNSAFE_CONFIGURE=1
 
 # Pip global options
-ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONDONTWRITEBYTECODE=1   \
+    PIP_NO_CACHE_DIR=1          \
+    PIP_ROOT_USER_ACTION=ignore \
+    UV_NO_CACHE=1
 
 # Custom install location
+# Note: LD_LIBRARY_PATH and CMAKE_PREFIX_PATH are unset in the base image, so
+#       they are assigned instead of prepended - an empty entry (trailing ":")
+#       in LD_LIBRARY_PATH would add the current directory to the search path.
 ENV PATH="/opt/warpx/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/opt/warpx/lib:${LD_LIBRARY_PATH}"
-ENV CMAKE_PREFIX_PATH="/opt/warpx:${CMAKE_PREFIX_PATH}"
+ENV LD_LIBRARY_PATH="/opt/warpx/lib"
+ENV CMAKE_PREFIX_PATH="/opt/warpx"
 
 # Install essential system dependencies (development)
 RUN apt-get update           && \
@@ -85,13 +94,17 @@ RUN apt-get update           && \
     rm -rf /var/lib/apt/lists/*
 
 # Install c-blosc from source
+# Note: all sources below are cloned shallow: we pin tags and never need history.
+ARG blosc2_version=v2.14.4
 RUN git clone                               \
-      -b v2.14.4                            \
+      --depth 1 --single-branch             \
+      -b ${blosc2_version}                  \
       https://github.com/Blosc/c-blosc2.git \
       /tmp/c-blosc2                      && \
     cmake                                   \
       -S /tmp/c-blosc2                      \
       -B /tmp/c-blosc2-build                \
+      -DCMAKE_BUILD_TYPE=Release            \
       -DCMAKE_INSTALL_PREFIX=/opt/warpx     \
       -DBUILD_STATIC=OFF                    \
       -DBUILD_TESTS=OFF                     \
@@ -102,62 +115,80 @@ RUN git clone                               \
                                          && \
     cmake --build /tmp/c-blosc2-build       \
           --target install                  \
-          -j${NJOBS} &&                     \
+          -j${NJOBS:-$(nproc)}           && \
     rm -rf /tmp/c-blosc2*
 
 # Install ADIOS2 from source
 # TODO: -DADIOS2_USE_SST=ON
+# Note: engines and bindings that WarpX does not use are switched off
+#       explicitly, which saves build time and image size.
+ARG adios2_version=v2.10.2
 RUN git clone                                   \
-        -b v2.10.2                              \
+        --depth 1 --single-branch               \
+        -b ${adios2_version}                    \
         https://github.com/ornladios/ADIOS2.git \
         /tmp/adios2                             \
                                              && \
-    cmake -S /tmp/adios2           \
-          -B /tmp/adios2-build     \
-          -DADIOS2_USE_Blosc2=ON   \
-          -DADIOS2_USE_BZip2=ON    \
-          -DADIOS2_USE_Fortran=OFF \
-          -DADIOS2_USE_SST=OFF     \
-          -DADIOS2_USE_SZ=OFF      \
-          -DADIOS2_USE_MGARD=OFF   \
-          -DADIOS2_USE_MPI=OFF     \
-          -DADIOS2_USE_PNG=ON      \
-          -DADIOS2_USE_Python=OFF  \
-          -DADIOS2_USE_ZeroMQ=OFF  \
-          -DADIOS2_USE_ZFP=OFF     \
+    cmake -S /tmp/adios2             \
+          -B /tmp/adios2-build       \
+          -DADIOS2_USE_Blosc2=ON     \
+          -DADIOS2_USE_BZip2=ON      \
+          -DADIOS2_USE_DataMan=OFF   \
+          -DADIOS2_USE_Fortran=OFF   \
+          -DADIOS2_USE_HDF5=ON       \
+          -DADIOS2_USE_SSC=OFF       \
+          -DADIOS2_USE_SST=OFF       \
+          -DADIOS2_USE_SZ=OFF        \
+          -DADIOS2_USE_MGARD=OFF     \
+          -DADIOS2_USE_MPI=OFF       \
+          -DADIOS2_USE_PNG=ON        \
+          -DADIOS2_USE_Python=OFF    \
+          -DADIOS2_USE_Table=OFF     \
+          -DADIOS2_USE_ZeroMQ=OFF    \
+          -DADIOS2_USE_ZFP=OFF       \
+          -DADIOS2_BUILD_EXAMPLES=OFF       \
+          -DBUILD_TESTING=OFF               \
+          -DCMAKE_BUILD_TYPE=Release        \
           -DCMAKE_INSTALL_PREFIX=/opt/warpx \
                                          && \
     cmake --build /tmp/adios2-build         \
-          --target install -j${NJOBS}    && \
+          --target install                  \
+          -j${NJOBS:-$(nproc)}           && \
     rm -rf /tmp/adios2*
 
 # Install BLAS++ and LAPACK++
-RUN git clone                  \
-        -b v2024.05.31         \
+ARG blaspp_version=v2024.05.31
+RUN git clone                     \
+        --depth 1 --single-branch \
+        -b ${blaspp_version}      \
         https://github.com/icl-utk-edu/blaspp.git \
-        /tmp/blaspp         && \
-    cd /tmp/blaspp &&          \
-    cmake -S /tmp/blaspp       \
-       -B /tmp/blaspp-build    \
-       -Duse_openmp=OFF        \
-       -Dgpu_backend=cuda      \
-       -DCMAKE_CXX_STANDARD=20 \
+        /tmp/blaspp            && \
+    cmake -S /tmp/blaspp          \
+       -B /tmp/blaspp-build       \
+       -Dbuild_tests=OFF          \
+       -Duse_openmp=OFF           \
+       -Dgpu_backend=cuda         \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_CXX_STANDARD=20    \
        -DCMAKE_INSTALL_PREFIX=/opt/warpx                         \
        -DBLAS_LIBRARIES=/usr/lib/x86_64-linux-gnu/libblas.so     \
        -DLAPACK_LIBRARIES=/usr/lib/x86_64-linux-gnu/liblapack.so \
                                   && \
     cmake --build /tmp/blaspp-build  \
           --target install           \
-          -j${NJOBS}              && \
+          -j${NJOBS:-$(nproc)}    && \
     rm -rf /tmp/blaspp*
 
+ARG lapackpp_version=v2024.05.31
 RUN git clone                     \
-      -b v2024.05.31              \
+      --depth 1 --single-branch   \
+      -b ${lapackpp_version}      \
       https://github.com/icl-utk-edu/lapackpp.git \
       /tmp/lapackpp               \
                                && \
     cmake -S /tmp/lapackpp        \
       -B /tmp/lapackpp-build      \
+      -DCMAKE_BUILD_TYPE=Release  \
       -DCMAKE_CXX_STANDARD=20     \
       -Dbuild_tests=OFF           \
       -DCMAKE_INSTALL_PREFIX=/opt/warpx \
@@ -165,20 +196,19 @@ RUN git clone                     \
                                       && \
     cmake --build /tmp/lapackpp-build    \
           --target install               \
-          -j${NJOBS}                  && \
+          -j${NJOBS:-$(nproc)}        && \
     rm -rf /tmp/lapackpp*
 
 # Create and activate Python virtual environment
-ENV PATH="/opt/venv/bin:${PATH}"
-RUN python3 -m venv /opt/venv && \
+ENV VIRTUAL_ENV="/opt/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+RUN python3 -m venv ${VIRTUAL_ENV} && \
     pip install          \
-        --no-cache-dir   \
         --upgrade        \
         pip              \
         uv               \
                       && \
     uv pip install       \
-        --no-cache-dir   \
         --upgrade        \
         build            \
         cmake            \
@@ -204,16 +234,19 @@ RUN python3 -m venv /opt/venv && \
 #            \
 #                      && \
 #    uv pip install       \
-#        --no-cache-dir                                      \
 #        --upgrade                                           \
 #        --index-url https://download.pytorch.org/whl/cu132  \
 #        torch
 #        optimas[all]
 
 # Build WarpX
+# Note: the WarpX version is declared as late as possible, so that a version
+#       bump reuses the cached dependency layers above.
 # TODO: -DWarpX_DIMS="1;2;RCYLINDER;RSPHERE;RZ;3"
 # TODO: -DWarpX_QED_TABLE_GEN=ON (needs boost math)
+ARG warpx_version=25.11
 RUN git clone                       \
+        --depth 1 --single-branch   \
         -b ${warpx_version}         \
         https://github.com/BLAST-WarpX/warpx.git \
         /tmp/warpx-src           && \
@@ -221,6 +254,7 @@ RUN git clone                       \
         -S /tmp/warpx-src           \
         -B /tmp/warpx-build         \
         -DBUILD_SHARED_LIBS=ON      \
+        -DCMAKE_BUILD_TYPE=Release  \
         -DCMAKE_INSTALL_PREFIX=/opt/warpx \
         -DWarpX_COMPUTE=CUDA        \
         -DWarpX_DIMS="1;2;RZ;3"     \
@@ -231,11 +265,11 @@ RUN git clone                       \
                                  && \
     cmake --build /tmp/warpx-build  \
           --target install          \
-          -j${NJOBS}                \
+          -j${NJOBS:-$(nproc)}      \
                                  && \
     cmake --build /tmp/warpx-build  \
           --target pip_install      \
-          -j${NJOBS}                \
+          -j${NJOBS:-$(nproc)}      \
                                  && \
     rm -rf /tmp/warpx*           && \
     ln -s /opt/warpx/bin/warpx.1d* /opt/warpx/bin/warpx.1d  && \
@@ -247,7 +281,18 @@ RUN git clone                       \
 # Reduce to runtime
 FROM nvidia/cuda:13.2.1-runtime-ubuntu22.04 AS warpx
 
+LABEL org.opencontainers.image.title="WarpX (Perlmutter GPU, no MPI)"                            \
+      org.opencontainers.image.description="WarpX for NERSC Perlmutter A100 nodes, built w/o MPI" \
+      org.opencontainers.image.source="https://github.com/BLAST-WarpX/warpx"                     \
+      org.opencontainers.image.documentation="https://warpx.readthedocs.io"                      \
+      org.opencontainers.image.licenses="BSD-3-Clause-LBNL"
+
+# Ubuntu apt global options
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install essential system dependencies (runtime)
+# Note: pip lives inside the virtual environment that is copied in below, so the
+#       system-wide python3-pip and its dependency chain are not needed here.
 RUN apt-get update            && \
     apt-get install              \
         -y                       \
@@ -255,7 +300,6 @@ RUN apt-get update            && \
         ca-certificates     \
         coreutils           \
         python3             \
-        python3-pip         \
         python3-venv        \
         libblas3            \
         libbz2-1.0          \
@@ -269,6 +313,21 @@ RUN apt-get update            && \
 # Copy installed software from previous stage
 COPY --from=warpx-dev /opt/warpx /opt/warpx
 COPY --from=warpx-dev /opt/venv /opt/venv
+
+# Make the runtime environment self-contained, i.e. also usable when the
+# entrypoint below is bypassed (podman run --entrypoint ...)
+ENV WARPX_ROOT="/opt/warpx"
+ENV VIRTUAL_ENV="/opt/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${WARPX_ROOT}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${WARPX_ROOT}/lib"
+ENV CMAKE_PREFIX_PATH="${WARPX_ROOT}"
+# The usual HDF5 quirk for various FS and containers
+ENV HDF5_USE_FILE_LOCKING="FALSE"
+
+# Register the WarpX libraries with the dynamic linker, so they are found even
+# by processes that reset LD_LIBRARY_PATH
+RUN echo "/opt/warpx/lib" > /etc/ld.so.conf.d/warpx.conf && \
+    ldconfig
 
 # Set up entrypoint
 COPY entrypoint.sh /opt/entrypoint.sh
